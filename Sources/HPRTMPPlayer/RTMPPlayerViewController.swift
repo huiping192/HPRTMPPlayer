@@ -8,15 +8,15 @@ public class RTMPPlayerViewController: UIViewController {
   public override func viewDidLoad() {
     super.viewDidLoad()
     
-    // Initialize AVSampleBufferDisplayLayer and add it to the view
+    configureLayer()
+  }
+  
+  private func configureLayer() {
     sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     sampleBufferDisplayLayer.frame = view.bounds
     sampleBufferDisplayLayer.videoGravity = .resizeAspect
     sampleBufferDisplayLayer.backgroundColor = UIColor.black.cgColor
     view.layer.addSublayer(sampleBufferDisplayLayer)
-    
-    // Assume you have a CMSampleBuffer named sampleBuffer
-    // enqueue(sampleBuffer: sampleBuffer)
   }
   
   func enqueue(sampleBuffer: CMSampleBuffer) {

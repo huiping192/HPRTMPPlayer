@@ -23,6 +23,65 @@ class H264Decoder {
     }
   }
   
+  func extractSPSandPPS(from videoHeader: Data) -> (sps: Data, pps: Data)? {
+    // Skip initial bytes and reach where SPS size is stored
+    // [0x17][0x00][0x00, 0x00, 0x00][0x01][sps[1], sps[2], sps[3], 0xff][0xe1] = 16 bytes
+    let spsSizeStartPosition = 16
+    if videoHeader.count < spsSizeStartPosition + 2 {
+      return nil
+    }
+    
+    // Read SPS size
+    let spsSize = (Int(videoHeader[spsSizeStartPosition]) << 8) | Int(videoHeader[spsSizeStartPosition + 1])
+    
+    // Extract SPS Data
+    let spsData = videoHeader.subdata(in: (spsSizeStartPosition + 2)..<(spsSizeStartPosition + 2 + spsSize))
+    
+    // Calculate where PPS size is stored in the array, skip SPS size and SPS data
+    let ppsSizeStartPosition = spsSizeStartPosition + 2 + spsSize + 1
+    
+    if videoHeader.count < ppsSizeStartPosition + 2 {
+      return nil
+    }
+    
+    // Read PPS size
+    let ppsSize = (Int(videoHeader[ppsSizeStartPosition]) << 8) | Int(videoHeader[ppsSizeStartPosition + 1])
+    
+    // Extract PPS Data
+    let ppsData = videoHeader.subdata(in: (ppsSizeStartPosition + 2)..<(ppsSizeStartPosition + 2 + ppsSize))
+    
+    return (sps: spsData, pps: ppsData)
+  }
+  
+  func createFormatDescription(sps: Data, pps: Data) -> CMFormatDescription? {
+    var formatDescription: CMFormatDescription?
+    
+    let parameterSets: [Data] = [sps, pps]
+    let parameterSetPointers = parameterSets.map { (data) -> UnsafePointer<UInt8> in
+      return data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> UnsafePointer<UInt8> in
+        return bytes.bindMemory(to: UInt8.self).baseAddress!
+      }
+    }
+    
+    let parameterSetSizes = parameterSets.map { (data) -> Int in
+      return data.count
+    }
+    
+    let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
+                                                                     parameterSetCount: parameterSets.count,
+                                                                     parameterSetPointers: parameterSetPointers,
+                                                                     parameterSetSizes: parameterSetSizes,
+                                                                     nalUnitHeaderLength: 4,
+                                                                     formatDescriptionOut: &formatDescription)
+    
+    if status == noErr {
+      return formatDescription
+    } else {
+      print("Error creating format description: \(status)")
+      return nil
+    }
+  }
+  
   func createDecompressionSession(_ formatDescription: CMFormatDescription) {
     self.formatDescription = formatDescription  // Store formatDescription for later use
     
