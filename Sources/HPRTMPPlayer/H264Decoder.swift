@@ -8,12 +8,26 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 
+
+enum H264DecoderError: Error {
+  case invalidVideoHeader
+}
+
+
 class H264Decoder {
   var decodeSession: VTDecompressionSession?
   var formatDescription: CMFormatDescription?
   
-  init() {
-    // Initialize the decoder
+  init(videoHeader: Data) throws {
+    guard let (sps, pps) = extractSPSandPPS(from: videoHeader) else {
+      throw H264DecoderError.invalidVideoHeader
+    }
+    
+    guard let formatDescription = createFormatDescription(sps: sps, pps: pps) else {
+      throw H264DecoderError.invalidVideoHeader
+    }
+    
+    createDecompressionSession(formatDescription)
   }
   
   deinit {
