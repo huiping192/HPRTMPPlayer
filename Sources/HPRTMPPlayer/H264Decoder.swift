@@ -8,15 +8,18 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 
-
-enum H264DecoderError: Error {
-  case invalidVideoHeader
-}
-
-
 class H264Decoder {
-  var decodeSession: VTDecompressionSession?
-  var formatDescription: CMFormatDescription?
+  private var decodeSession: VTDecompressionSession?
+  private var formatDescription: CMFormatDescription?
+  
+  enum H264DecoderError: Error {
+    case invalidVideoHeader
+    case formatDescriptionCreationFailed(status: OSStatus)
+    case decompressionSessionCreationFailed(status: OSStatus)
+    case frameDecodingFailed(status: OSStatus)
+    case outputHandlerFailed
+    case sampleBufferCreationFailed(status: OSStatus)
+  }
   
   init(videoHeader: Data) throws {
     guard let (sps, pps) = extractSPSandPPS(from: videoHeader) else {
@@ -24,10 +27,10 @@ class H264Decoder {
     }
     
     guard let formatDescription = createFormatDescription(sps: sps, pps: pps) else {
-      throw H264DecoderError.invalidVideoHeader
+      throw H264DecoderError.formatDescriptionCreationFailed(status: -1)
     }
     
-    createDecompressionSession(formatDescription)
+    try createDecompressionSession(formatDescription)
   }
   
   deinit {
@@ -37,11 +40,11 @@ class H264Decoder {
     }
   }
   
-  func extractSPSandPPS(from videoHeader: Data) -> (sps: Data, pps: Data)? {
+  private func extractSPSandPPS(from videoHeader: Data) -> (sps: Data, pps: Data)? {
     // Skip initial bytes and reach where SPS size is stored
     // [0x17][0x00][0x00, 0x00, 0x00][0x01][sps[1], sps[2], sps[3], 0xff][0xe1] = 16 bytes
     let spsSizeStartPosition = 16
-    if videoHeader.count < spsSizeStartPosition + 2 {
+    guard videoHeader.count >= spsSizeStartPosition + 2 else {
       return nil
     }
     
@@ -54,7 +57,7 @@ class H264Decoder {
     // Calculate where PPS size is stored in the array, skip SPS size and SPS data
     let ppsSizeStartPosition = spsSizeStartPosition + 2 + spsSize + 1
     
-    if videoHeader.count < ppsSizeStartPosition + 2 {
+    guard videoHeader.count >= ppsSizeStartPosition + 2 else {
       return nil
     }
     
@@ -67,7 +70,7 @@ class H264Decoder {
     return (sps: spsData, pps: ppsData)
   }
   
-  func createFormatDescription(sps: Data, pps: Data) -> CMFormatDescription? {
+  private func createFormatDescription(sps: Data, pps: Data) -> CMFormatDescription? {
     var formatDescription: CMFormatDescription?
     
     let parameterSets: [Data] = [sps, pps]
@@ -81,7 +84,7 @@ class H264Decoder {
       return data.count
     }
     
-    let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
+    let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: kCFAllocatorDefault,
                                                                      parameterSetCount: parameterSets.count,
                                                                      parameterSetPointers: parameterSetPointers,
                                                                      parameterSetSizes: parameterSetSizes,
@@ -96,14 +99,14 @@ class H264Decoder {
     }
   }
   
-  func createDecompressionSession(_ formatDescription: CMFormatDescription) {
+  private func createDecompressionSession(_ formatDescription: CMFormatDescription) throws {
     self.formatDescription = formatDescription  // Store formatDescription for later use
     
     let videoOutput: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     ]
     
-    let status = VTDecompressionSessionCreate(
+    var status = VTDecompressionSessionCreate(
       allocator: kCFAllocatorDefault,
       formatDescription: formatDescription,
       decoderSpecification: nil,
@@ -112,14 +115,20 @@ class H264Decoder {
       decompressionSessionOut: &decodeSession
     )
     
-    if status != noErr {
-      print("Error creating decompression session")
+    guard status == noErr else {
+      throw H264DecoderError.decompressionSessionCreationFailed(status: status)
+    }
+    
+    var threadCountValue = 1
+    status = VTSessionSetProperty(decodeSession!, key: kVTDecompressionPropertyKey_ThreadCount, value:CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &threadCountValue))
+    guard status == noErr else {
+      throw H264DecoderError.decompressionSessionCreationFailed(status: status)
     }
   }
   
-  func decodeSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+  func decodeSampleBuffer(_ sampleBuffer: CMSampleBuffer, completion: @escaping (CMSampleBuffer?, Error?) -> Void) {
     guard let decodeSession = decodeSession else {
-      print("Decode session is not initialized")
+      completion(nil, H264DecoderError.decompressionSessionCreationFailed(status: -1))
       return
     }
     
@@ -131,39 +140,41 @@ class H264Decoder {
       infoFlagsOut: &infoFlags
     ) { status, infoFlags, imageBuffer, presentationTimeStamp, presentationDuration in
       guard status == noErr else {
-        print("Error in output handler")
+        completion(nil, H264DecoderError.frameDecodingFailed(status: status))
         return
       }
       
-      if let imageBuffer = imageBuffer,
-         let formatDescription = self.formatDescription {
-        
-        var sampleBuffer: CMSampleBuffer?
-        
-        var timingInfo = CMSampleTimingInfo(
-          duration: presentationDuration,
-          presentationTimeStamp: presentationTimeStamp,
-          decodeTimeStamp: CMTime.invalid
-        )
-        
-        let err = CMSampleBufferCreateReadyWithImageBuffer(
-          allocator: kCFAllocatorDefault,
-          imageBuffer: imageBuffer,
-          formatDescription: formatDescription,
-          sampleTiming: &timingInfo,
-          sampleBufferOut: &sampleBuffer
-        )
-        
-        if err == noErr, let sampleBuffer = sampleBuffer {
-          // Now you have a CMSampleBuffer that you can use
-          print("Decoded CMSampleBuffer: \(sampleBuffer)")
-        }
+      guard let imageBuffer = imageBuffer,
+            let formatDescription = self.formatDescription else {
+        completion(nil, H264DecoderError.outputHandlerFailed)
+        return
+      }
+      
+      var sampleBuffer: CMSampleBuffer?
+      
+      var timingInfo = CMSampleTimingInfo(
+        duration: presentationDuration,
+        presentationTimeStamp: presentationTimeStamp,
+        decodeTimeStamp: CMTime.invalid
+      )
+      
+      let err = CMSampleBufferCreateReadyWithImageBuffer(
+        allocator: kCFAllocatorDefault,
+        imageBuffer: imageBuffer,
+        formatDescription: formatDescription,
+        sampleTiming: &timingInfo,
+        sampleBufferOut: &sampleBuffer
+      )
+      
+      if err == noErr, let sampleBuffer = sampleBuffer {
+        completion(sampleBuffer, nil)
+      } else {
+        completion(nil, H264DecoderError.sampleBufferCreationFailed(status: err))
       }
     }
     
     if status != noErr {
-      print("Error decoding frame")
+      completion(nil, H264DecoderError.frameDecodingFailed(status: status))
     }
   }
 }
-
