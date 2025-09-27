@@ -10,7 +10,11 @@ import CoreMedia
 
 class H264Decoder {
   private var decodeSession: VTDecompressionSession?
-  private var formatDescription: CMFormatDescription?
+  private var _formatDescription: CMFormatDescription?
+
+  var formatDescription: CMFormatDescription? {
+    return _formatDescription
+  }
   
   enum H264DecoderError: Error {
     case invalidVideoHeader
@@ -41,32 +45,88 @@ class H264Decoder {
   }
   
   private func extractSPSandPPS(from videoHeader: Data) -> (sps: Data, pps: Data)? {
-    // Skip initial bytes and reach where SPS size is stored
-    // [0x17][0x00][0x00, 0x00, 0x00][0x01][sps[1], sps[2], sps[3], 0xff][0xe1] = 16 bytes
-    let spsSizeStartPosition = 16
-    guard videoHeader.count >= spsSizeStartPosition + 2 else {
+    // H.264 配置数据格式:
+    // [0x17][0x00][0x00, 0x00, 0x00][configRecord...]
+    // configRecord格式: [configurationVersion][profile][compatibility][level][lengthSizeMinusOne][SPS data...]
+    guard videoHeader.count >= 16 else {
+      print("Video header too short: \(videoHeader.count)")
       return nil
     }
-    
-    // Read SPS size
-    let spsSize = (Int(videoHeader[spsSizeStartPosition]) << 8) | Int(videoHeader[spsSizeStartPosition + 1])
-    
-    // Extract SPS Data
-    let spsData = videoHeader.subdata(in: (spsSizeStartPosition + 2)..<(spsSizeStartPosition + 2 + spsSize))
-    
-    // Calculate where PPS size is stored in the array, skip SPS size and SPS data
-    let ppsSizeStartPosition = spsSizeStartPosition + 2 + spsSize + 1
-    
-    guard videoHeader.count >= ppsSizeStartPosition + 2 else {
+
+    // 跳过配置记录前部 (版本、profile、兼容性、级别、长度大小)，直接查找SPS数量和长度
+    let spsCountPosition = 10  // 0x17(1) + 0x00(1) + composition time(3) + config record start(5) = 10
+    guard videoHeader.count > spsCountPosition else {
+      print("Video header too short for SPS count: \(videoHeader.count)")
       return nil
     }
-    
-    // Read PPS size
-    let ppsSize = (Int(videoHeader[ppsSizeStartPosition]) << 8) | Int(videoHeader[ppsSizeStartPosition + 1])
-    
-    // Extract PPS Data
-    let ppsData = videoHeader.subdata(in: (ppsSizeStartPosition + 2)..<(ppsSizeStartPosition + 2 + ppsSize))
-    
+
+    let spsCount = videoHeader[spsCountPosition] & 0x1F  // 取低5位
+    print("SPS count: \(spsCount)")
+
+    guard spsCount > 0 else {
+      print("No SPS found")
+      return nil
+    }
+
+    // SPS长度位置
+    let spsSizePosition = spsCountPosition + 1
+    guard videoHeader.count >= spsSizePosition + 2 else {
+      print("Video header too short for SPS size: \(videoHeader.count)")
+      return nil
+    }
+
+    // 读取SPS长度 (big-endian 16位)
+    let spsSize = (Int(videoHeader[spsSizePosition]) << 8) | Int(videoHeader[spsSizePosition + 1])
+    print("SPS size: \(spsSize)")
+
+    // 检查SPS数据长度
+    let spsDataStart = spsSizePosition + 2
+    let spsDataEnd = spsDataStart + spsSize
+    guard videoHeader.count >= spsDataEnd else {
+      print("Video header too short for SPS data: need \(spsDataEnd), have \(videoHeader.count)")
+      return nil
+    }
+
+    // 提取SPS数据
+    let spsData = videoHeader.subdata(in: spsDataStart..<spsDataEnd)
+
+    // PPS数量位置
+    let ppsCountPosition = spsDataEnd
+    guard videoHeader.count > ppsCountPosition else {
+      print("Video header too short for PPS count: \(videoHeader.count)")
+      return nil
+    }
+
+    let ppsCount = videoHeader[ppsCountPosition]
+    print("PPS count: \(ppsCount)")
+
+    guard ppsCount > 0 else {
+      print("No PPS found")
+      return nil
+    }
+
+    // PPS长度位置
+    let ppsSizePosition = ppsCountPosition + 1
+    guard videoHeader.count >= ppsSizePosition + 2 else {
+      print("Video header too short for PPS size: \(videoHeader.count)")
+      return nil
+    }
+
+    // 读取PPS长度 (big-endian 16位)
+    let ppsSize = (Int(videoHeader[ppsSizePosition]) << 8) | Int(videoHeader[ppsSizePosition + 1])
+    print("PPS size: \(ppsSize)")
+
+    // 检查PPS数据长度
+    let ppsDataStart = ppsSizePosition + 2
+    let ppsDataEnd = ppsDataStart + ppsSize
+    guard videoHeader.count >= ppsDataEnd else {
+      print("Video header too short for PPS data: need \(ppsDataEnd), have \(videoHeader.count)")
+      return nil
+    }
+
+    // 提取PPS数据
+    let ppsData = videoHeader.subdata(in: ppsDataStart..<ppsDataEnd)
+
     return (sps: spsData, pps: ppsData)
   }
   
@@ -100,7 +160,7 @@ class H264Decoder {
   }
   
   private func createDecompressionSession(_ formatDescription: CMFormatDescription) throws {
-    self.formatDescription = formatDescription  // Store formatDescription for later use
+    self._formatDescription = formatDescription  // Store formatDescription for later use
     
     let videoOutput: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -145,7 +205,7 @@ class H264Decoder {
       }
       
       guard let imageBuffer = imageBuffer,
-            let formatDescription = self.formatDescription else {
+            let formatDescription = self._formatDescription else {
         completion(nil, H264DecoderError.outputHandlerFailed)
         return
       }
