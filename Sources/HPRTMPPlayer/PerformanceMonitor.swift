@@ -65,14 +65,14 @@ public class PerformanceMonitor {
         let fps = duration > 0 ? Double(frameCount) / duration : 0
 
         var averageFrameTime: Double = 0
-        if frameTimes.count > 1 {
-            let recentFrameTimes = frameTimes.suffix(min(60, frameTimes.count))
-            var totalInterval: Double = 0
-            for i in 1..<recentFrameTimes.count {
-                totalInterval += recentFrameTimes[i] - recentFrameTimes[i-1]
-            }
-            averageFrameTime = totalInterval / Double(recentFrameTimes.count - 1)
-        }
+//        if frameTimes.count > 1 {
+//            let recentFrameTimes = frameTimes.suffix(min(60, frameTimes.count))
+//            var totalInterval: Double = 0
+//            for i in 1..<recentFrameTimes.count {
+//                totalInterval += recentFrameTimes[i] - recentFrameTimes[i-1]
+//            }
+//            averageFrameTime = totalInterval / Double(recentFrameTimes.count - 1)
+//        }
 
         return PlaybackStats(
             fps: fps,

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Read(//Users/huipingguo/git/HPRTMP/Sources/**)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Read(//Users/huipingguo/git/HPRTMP/**)"
     ],
     "deny": [],
     "ask": []
