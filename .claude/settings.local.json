@@ -3,7 +3,9 @@
     "allow": [
       "Read(//Users/huipingguo/git/HPRTMP/Sources/**)",
       "Bash(mkdir:*)",
-      "Read(//Users/huipingguo/git/HPRTMP/**)"
+      "Read(//Users/huipingguo/git/HPRTMP/**)",
+      "Read(//Users/huipingguo/git/**)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": []

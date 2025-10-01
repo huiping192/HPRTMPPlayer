@@ -44,12 +44,12 @@ public class RTMPPlayer {
   private var h264Decoder: H264Decoder?
   private var audioDecoder: AudioDecoder?
   private var audioPlayer: AudioPlayer?
-  
+
   private var currentURL: String?
   private var reconnectAttempts = 0
   private let maxReconnectAttempts = 3
   private var reconnectTimer: Timer?
-  private var delegateWrapper: RTMPPlayerDelegateWrapper?
+  private var streamTasks: [Task<Void, Never>] = []
   
   // MARK: - Initialization
   public init() {
@@ -63,11 +63,61 @@ public class RTMPPlayer {
   // MARK: - Private Setup
   private func setupRTMPSession() {
     rtmpPlayerSession = RTMPPlayerSession()
-    let delegateWrapper = RTMPPlayerDelegateWrapper(rtmpPlayer: self)
-    Task {
-      await rtmpPlayerSession.setDelegate(delegateWrapper)
-      self.delegateWrapper = delegateWrapper
+
+    // Start listening to all AsyncStreams
+    startStreamListeners()
+  }
+
+  private func startStreamListeners() {
+    // Listen to status changes
+    let statusTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await status in await rtmpPlayerSession.statusStream {
+        await self.handleStatusChange(status)
+      }
     }
+
+    // Listen to errors
+    let errorTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await error in await rtmpPlayerSession.errorStream {
+        await self.handleError(error)
+      }
+    }
+
+    // Listen to video data
+    let videoTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await (data, timestamp) in await rtmpPlayerSession.videoStream {
+        await self.handleVideoData(data: data, timestamp: timestamp)
+      }
+    }
+
+    // Listen to audio data
+    let audioTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await (data, timestamp) in await rtmpPlayerSession.audioStream {
+        await self.handleAudioData(data: data, timestamp: timestamp)
+      }
+    }
+
+    // Listen to metadata
+    let metaTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await meta in await rtmpPlayerSession.metaStream {
+        await self.handleMetaData(meta)
+      }
+    }
+
+    // Listen to statistics
+    let statisticsTask = Task { [weak self] in
+      guard let self = self else { return }
+      for await statistics in await rtmpPlayerSession.statisticsStream {
+        await self.handleStatistics(statistics)
+      }
+    }
+
+    streamTasks = [statusTask, errorTask, videoTask, audioTask, metaTask, statisticsTask]
   }
   
   // MARK: - Public Methods
@@ -164,10 +214,10 @@ public class RTMPPlayer {
   
   private func performReconnect(url: String) {
     print("执行重连: \(url)")
-    
+
     h264Decoder = nil
     audioDecoder = nil
-    
+
     Task {
       await rtmpPlayerSession.play(url: url)
     }
@@ -181,6 +231,11 @@ public class RTMPPlayer {
   
   private func cleanupResources() {
     resetReconnectState()
+
+    // Cancel all stream listening tasks
+    streamTasks.forEach { $0.cancel() }
+    streamTasks.removeAll()
+
     h264Decoder = nil
     audioDecoder = nil
     audioPlayer?.stop()
@@ -191,7 +246,7 @@ public class RTMPPlayer {
   internal func initializeH264Decoder(with videoHeader: Data) {
     do {
       h264Decoder = try H264Decoder(videoHeader: videoHeader)
-      print("H264解码器初始化成功")
+      print("H264解码器和缓冲池初始化成功")
     } catch {
       print("H264解码器初始化失败: \(error)")
     }
@@ -200,12 +255,12 @@ public class RTMPPlayer {
   internal func processVideoFrame(data: Data, timestamp: Int64) {
     guard let decoder = h264Decoder else {
       print("解码器未初始化，尝试从当前数据初始化解码器")
-      
+
       // 如果是关键帧或配置数据，尝试初始化解码器
       if data.count > 5 && (data[0] == 0x17 || data[0] == 0x27) {
         print("尝试用当前视频数据初始化解码器")
         initializeH264Decoder(with: data)
-        
+
         // 递归调用，用新初始化的解码器处理
         if h264Decoder != nil {
           processVideoFrame(data: data, timestamp: timestamp)
@@ -213,24 +268,28 @@ public class RTMPPlayer {
       }
       return
     }
-    
+
+
+    // 计算相对时间戳（从0开始）
     guard let sampleBuffer = createSampleBuffer(from: data, timestamp: timestamp) else {
       print("创建SampleBuffer失败")
       return
     }
     
+    let timeinfo = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
     decoder.decodeSampleBuffer(sampleBuffer) { [weak self] decodedSampleBuffer, error in
-      DispatchQueue.main.async {
-        if let error = error {
-          print("解码失败: \(error)")
-          PerformanceMonitor.shared.recordDroppedFrame()
-          return
-        }
-        
-        if let decodedSampleBuffer = decodedSampleBuffer {
-          self?.delegate?.rtmpPlayer(self!, didReceiveVideoSampleBuffer: decodedSampleBuffer)
-          PerformanceMonitor.shared.recordFrame()
-        }
+      guard let self = self else { return }
+
+      if let error = error {
+        print("解码失败: \(error)")
+        PerformanceMonitor.shared.recordDroppedFrame()
+        return
+      }
+
+      if let decodedSampleBuffer = decodedSampleBuffer {
+        self.delegate?.rtmpPlayer(self, didReceiveVideoSampleBuffer: decodedSampleBuffer)
+        PerformanceMonitor.shared.recordFrame()
       }
     }
   }
@@ -341,7 +400,6 @@ public class RTMPPlayer {
   }
   
   // MARK: - Internal Methods for Actor Wrapper
-  @MainActor
   internal func handleVideoData(data: Data, timestamp: Int64) {
     guard playbackState != .paused else { return }
     
@@ -402,7 +460,6 @@ public class RTMPPlayer {
     processAudioFrame(data: data, timestamp: timestamp)
   }
   
-  @MainActor
   internal func handleStatusChange(_ status: RTMPPlayerSession.Status) {
     print("RTMP状态变化: \(status)")
     
@@ -431,14 +488,12 @@ public class RTMPPlayer {
     }
   }
   
-  @MainActor
   internal func handleError(_ error: RTMPError) {
     print("RTMP错误: \(error)")
     playbackState = .error(error)
     attemptReconnect()
   }
   
-  @MainActor
   internal func handleMetaData(_ meta: MetaDataResponse) {
     print("收到元数据: \(meta)")
     
@@ -454,61 +509,12 @@ public class RTMPPlayer {
     delegate?.rtmpPlayer(self, didReceiveVideoConfiguration: config)
   }
   
-  @MainActor
   internal func handleStatistics(_ statistics: Any) {
     print("传输统计: \(statistics)")
     // 由于TransmissionStatistics类型不可用，我们传递一个简化的统计信息
   }
 }
 
-// MARK: - Internal Actor Wrapper for RTMPPlayerSessionDelegate
-private actor RTMPPlayerDelegateWrapper: RTMPPlayerSessionDelegate {
-  weak var rtmpPlayer: RTMPPlayer?
-  
-  init(rtmpPlayer: RTMPPlayer) {
-    self.rtmpPlayer = rtmpPlayer
-  }
-  
-  func sessionStatusChange(_ session: RTMPPlayerSession, status: RTMPPlayerSession.Status) {
-    Task {
-      guard let player = rtmpPlayer else { return }
-      await player.handleStatusChange(status)
-    }
-  }
-  
-  func sessionError(_ session: RTMPPlayerSession, error: RTMPError) {
-    Task {
-      guard let player = rtmpPlayer else { return }
-      await player.handleError(error)
-    }
-  }
-  
-  func sessionVideo(_ session: RTMPPlayerSession, data: Data, timestamp: Int64) async {
-    guard let player = rtmpPlayer else { return }
-    await player.handleVideoData(data: data, timestamp: timestamp)
-  }
-  
-  func sessionAudio(_ session: RTMPPlayerSession, data: Data, timestamp: Int64) {
-    Task {
-      guard let player = rtmpPlayer else { return }
-      await player.handleAudioData(data: data, timestamp: timestamp)
-    }
-  }
-  
-  func sessionMeta(_ session: RTMPPlayerSession, meta: MetaDataResponse) {
-    Task {
-      guard let player = rtmpPlayer else { return }
-      await player.handleMetaData(meta)
-    }
-  }
-  
-  func sessionTransmissionStatisticsChanged(_ session: RTMPPlayerSession, statistics: TransmissionStatistics) {
-    Task {
-      guard let player = rtmpPlayer else { return }
-      await player.handleStatistics(statistics)
-    }
-  }
-}
 
 // MARK: - Supporting Types
 public struct VideoConfiguration {
