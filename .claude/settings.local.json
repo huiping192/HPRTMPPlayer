@@ -5,7 +5,8 @@
       "Bash(mkdir:*)",
       "Read(//Users/huipingguo/git/HPRTMP/**)",
       "Read(//Users/huipingguo/git/**)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:stackoverflow.com)"
     ],
     "deny": [],
     "ask": []

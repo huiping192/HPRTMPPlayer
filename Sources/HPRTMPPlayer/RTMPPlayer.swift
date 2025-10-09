@@ -43,13 +43,16 @@ public class RTMPPlayer {
   private var rtmpPlayerSession: RTMPPlayerSession!
   private var h264Decoder: H264Decoder?
   private var audioDecoder: AudioDecoder?
-  private var audioPlayer: AudioPlayer?
 
   private var currentURL: String?
   private var reconnectAttempts = 0
   private let maxReconnectAttempts = 3
   private var reconnectTimer: Timer?
   private var streamTasks: [Task<Void, Never>] = []
+  
+  // 时间戳基准
+  private var firstVideoTimestamp: Int64?
+  private var firstAudioTimestamp: Int64?
   
   // MARK: - Initialization
   public init() {
@@ -131,6 +134,10 @@ public class RTMPPlayer {
     playbackState = .connecting
     resetReconnectState()
     
+    // 重置时间戳基准
+    firstVideoTimestamp = nil
+    firstAudioTimestamp = nil
+    
     Task {
       await rtmpPlayerSession.play(url: rtmpURLString)
     }
@@ -185,7 +192,8 @@ public class RTMPPlayer {
   public func enablePerformanceMonitoring() {
     // 监控性能
     let currentDelegate = delegate
-    delegate = RTMPPlayerPerformanceWrapper(originalDelegate: currentDelegate)
+    let wrapper = RTMPPlayerPerformanceWrapper(originalDelegate: currentDelegate)
+    delegate = wrapper
   }
   
   public func getPerformanceStats() -> PerformanceMonitor.PlaybackStats {
@@ -217,6 +225,10 @@ public class RTMPPlayer {
 
     h264Decoder = nil
     audioDecoder = nil
+    
+    // 重置时间戳基准
+    firstVideoTimestamp = nil
+    firstAudioTimestamp = nil
 
     Task {
       await rtmpPlayerSession.play(url: url)
@@ -238,8 +250,11 @@ public class RTMPPlayer {
 
     h264Decoder = nil
     audioDecoder = nil
-    audioPlayer?.stop()
-    audioPlayer = nil
+    
+    // 重置时间戳基准
+    firstVideoTimestamp = nil
+    firstAudioTimestamp = nil
+    
     delegate?.rtmpPlayerDidCleanupResources(self)
   }
   
@@ -276,7 +291,7 @@ public class RTMPPlayer {
       return
     }
     
-    let timeinfo = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    _ = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
     decoder.decodeSampleBuffer(sampleBuffer) { [weak self] decodedSampleBuffer, error in
       guard let self = self else { return }
@@ -296,6 +311,44 @@ public class RTMPPlayer {
   
   private func createSampleBuffer(from data: Data, timestamp: Int64) -> CMSampleBuffer? {
     guard data.count > 5 else { return nil }
+    
+    // 记录第一帧时间戳作为基准
+    if firstVideoTimestamp == nil {
+      firstVideoTimestamp = timestamp
+      print("设置视频时间戳基准: \(timestamp)")
+    }
+    
+    // 解析CompositionTime (byte 2-4, 24位有符号整数)
+    // RTMP格式: [FrameType+CodecID][AVCPacketType][CompositionTime(3 bytes)][Data...]
+    let compositionTime: Int32
+    if data.count >= 5 {
+      let byte2 = Int32(data[2])
+      let byte3 = Int32(data[3])
+      let byte4 = Int32(data[4])
+      
+      // 组合成24位整数
+      var ct = (byte2 << 16) | (byte3 << 8) | byte4
+      
+      // 处理有符号数（24位最高位为符号位）
+      if ct & 0x800000 != 0 {
+        ct = ct | Int32(bitPattern: 0xFF000000)  // 符号扩展到32位
+      }
+      compositionTime = ct
+    } else {
+      compositionTime = 0
+    }
+    
+    // DTS是RTMP的timestamp（相对于第一帧）
+    let dts = timestamp - (firstVideoTimestamp ?? 0)
+    
+    // PTS = DTS + CompositionTime
+    // CompositionTime表示显示时间与解码时间的差值
+    let pts = dts + Int64(compositionTime)
+    
+    // 打印时间戳信息用于调试
+    if dts % 1000 == 0 || dts < 500 { // 每秒打印一次或前几帧
+      print("视频帧 - 原始时间戳: \(timestamp), DTS: \(dts)ms, CT: \(compositionTime)ms, PTS: \(pts)ms")
+    }
     
     let naluData = data.subdata(in: 5..<data.count)
     
@@ -326,7 +379,8 @@ public class RTMPPlayer {
     }
     
     let timeScale: CMTimeScale = 1000
-    let presentationTime = CMTime(value: CMTimeValue(timestamp), timescale: timeScale)
+    let presentationTime = CMTime(value: CMTimeValue(pts), timescale: timeScale)
+    let decodeTime = CMTime(value: CMTimeValue(dts), timescale: timeScale)
     
     guard let decoder = h264Decoder,
           let formatDescription = decoder.formatDescription else {
@@ -336,8 +390,8 @@ public class RTMPPlayer {
     var sampleBuffer: CMSampleBuffer?
     let sampleTiming = CMSampleTimingInfo(
       duration: CMTime.invalid,
-      presentationTimeStamp: presentationTime,
-      decodeTimeStamp: CMTime.invalid
+      presentationTimeStamp: presentationTime,  // 使用PTS作为显示时间
+      decodeTimeStamp: decodeTime  // 使用DTS作为解码时间
     )
     
     let createStatus = CMSampleBufferCreate(
@@ -360,106 +414,166 @@ public class RTMPPlayer {
   
   internal func initializeAudioDecoder(with audioHeader: Data) {
     do {
+      print("[AAC音频] 初始化音频解码器")
+      print("[AAC音频] AudioSpecificConfig 字节: \(audioHeader.map { String(format: "%02X", $0) }.joined(separator: " "))")
+
       audioDecoder = AudioDecoder()
-      audioPlayer = try AudioPlayer()
-      
-      let sampleRate: Double = 44100
-      let channels: UInt32 = 2
-      
-      try audioDecoder?.setupForAAC(sampleRate: sampleRate, channels: channels)
-      print("音频解码器初始化成功")
+
+      // 使用新的方法从 RTMP 音频头解析配置
+      try audioDecoder?.setupFromRTMPAudioHeader(audioHeader)
+      print("[AAC音频] 音频解码器初始化成功")
     } catch {
-      print("音频解码器初始化失败: \(error)")
+      print("[AAC音频] 音频解码器初始化失败: \(error)")
     }
   }
   
   internal func processAudioFrame(data: Data, timestamp: Int64) {
-    guard let decoder = audioDecoder,
-          let player = audioPlayer else {
-      print("音频解码器未初始化，跳过音频帧")
+    guard let decoder = audioDecoder else { return }
+
+    // 只处理 AAC 原始数据 (data[1] == 0x01)
+    guard data.count > 2 && data[1] == 0x01 else { return }
+
+    // 提取 AAC 原始数据 (跳过 AudioTagHeader 和 AACPacketType)
+    let aacData = data.subdata(in: 2..<data.count)
+
+    // 解码 AAC 为 PCM
+    let pcmData: Data
+    do {
+      pcmData = try decoder.decode(aacData: aacData)
+    } catch {
       return
     }
-    
-    let audioData = data.subdata(in: 2..<data.count)
-    
-    decoder.decode(audioData: audioData) { [weak self] pcmData, error in
-      if let error = error {
-        print("音频解码失败: \(error)")
-        return
-      }
-      
-      if let pcmData = pcmData {
-        do {
-          try player.play(pcmData: pcmData)
-          self?.delegate?.rtmpPlayer(self!, didReceiveAudioData: pcmData, timestamp: timestamp)
-        } catch {
-          print("音频播放失败: \(error)")
-        }
-      }
+
+    // 用 PCM 数据创建 SampleBuffer
+    guard let sampleBuffer = createPCMSampleBuffer(pcmData: pcmData, timestamp: timestamp, decoder: decoder) else {
+      return
     }
+
+    delegate?.rtmpPlayer(self, didReceiveAudioSampleBuffer: sampleBuffer)
+  }
+  
+  private func createPCMSampleBuffer(pcmData: Data, timestamp: Int64, decoder: AudioDecoder) -> CMSampleBuffer? {
+    guard !pcmData.isEmpty else { return nil }
+
+    // 记录第一帧音频时间戳作为基准
+    if firstAudioTimestamp == nil {
+      firstAudioTimestamp = timestamp
+    }
+
+    // 计算相对时间戳（从0开始）
+    let pts = timestamp - (firstAudioTimestamp ?? 0)
+
+    // 创建 BlockBuffer
+    var blockBuffer: CMBlockBuffer?
+    let status = CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault,
+      memoryBlock: nil,
+      blockLength: pcmData.count,
+      blockAllocator: kCFAllocatorDefault,
+      customBlockSource: nil,
+      offsetToData: 0,
+      dataLength: pcmData.count,
+      flags: 0,
+      blockBufferOut: &blockBuffer
+    )
+
+    guard status == noErr, let blockBuffer = blockBuffer else {
+      return nil
+    }
+
+    _ = pcmData.withUnsafeBytes { bytes in
+      CMBlockBufferReplaceDataBytes(
+        with: bytes.baseAddress!,
+        blockBuffer: blockBuffer,
+        offsetIntoDestination: 0,
+        dataLength: pcmData.count
+      )
+    }
+
+    // 使用与视频相同的 timeScale (1000 = 毫秒)
+    let timeScale: CMTimeScale = 1000
+    let presentationTime = CMTime(value: CMTimeValue(pts), timescale: timeScale)
+
+    // 计算音频帧的 duration
+    // AAC 每帧 1024 samples，duration = 1024 / sampleRate
+    let samplesPerFrame: Int64 = 1024
+    let sampleRate = Int64(decoder.currentSampleRate)
+    let durationValue = (samplesPerFrame * Int64(timeScale)) / sampleRate
+    let duration = CMTime(value: durationValue, timescale: timeScale)
+
+    guard let formatDescription = decoder.formatDescription else {
+      return nil
+    }
+
+    var sampleBuffer: CMSampleBuffer?
+    let sampleTiming = CMSampleTimingInfo(
+      duration: duration,  // 设置正确的 duration
+      presentationTimeStamp: presentationTime,
+      decodeTimeStamp: CMTime.invalid
+    )
+
+    let createStatus = CMSampleBufferCreate(
+      allocator: kCFAllocatorDefault,
+      dataBuffer: blockBuffer,
+      dataReady: true,
+      makeDataReadyCallback: nil,
+      refcon: nil,
+      formatDescription: formatDescription,
+      sampleCount: 1,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: [sampleTiming],
+      sampleSizeEntryCount: 0,
+      sampleSizeArray: nil,
+      sampleBufferOut: &sampleBuffer
+    )
+
+    // 静默创建，不打印日志（减少性能开销）
+
+    return createStatus == noErr ? sampleBuffer : nil
   }
   
   // MARK: - Internal Methods for Actor Wrapper
+  @MainActor
   internal func handleVideoData(data: Data, timestamp: Int64) {
     guard playbackState != .paused else { return }
-    
-    print("收到视频数据: \(data.count) bytes, 时间戳: \(timestamp)")
-    
-    // 打印前几个字节用于调试
-    if data.count >= 5 {
-      let bytes = data.prefix(5).map { String(format: "0x%02X", $0) }.joined(separator: " ")
-      print("视频数据头: \(bytes)")
-    }
-    
-    // 收到视频数据说明连接和流传输正常，确保状态为playing
+
+    // 收到视频数据说明连接和流传输正常
     if playbackState == .connecting {
-      print("检测到视频数据，设置状态为播放中")
       playbackState = .playing
       resetReconnectState()
     }
-    
+
     // 检查是否为H264配置数据 (AVC sequence header)
     if data.count > 1 && data[0] == 0x17 && data[1] == 0x00 {
-      print("收到H264配置数据 (AVC sequence header)")
       initializeH264Decoder(with: data)
       return
     }
-    
-    // 检查是否为关键帧 (AVC NALU)
-    if data.count > 1 && data[0] == 0x17 && data[1] == 0x01 {
-      print("收到H264关键帧")
-    }
-    
-    // 检查是否为普通帧 (AVC NALU)
-    if data.count > 1 && data[0] == 0x27 && data[1] == 0x01 {
-      print("收到H264普通帧")
-    }
-    
+
     processVideoFrame(data: data, timestamp: timestamp)
   }
   
   @MainActor
   internal func handleAudioData(data: Data, timestamp: Int64) {
     guard playbackState != .paused else { return }
-    
-    print("收到音频数据: \(data.count) bytes, 时间戳: \(timestamp)")
-    
-    // 收到音频数据说明连接和流传输正常，确保状态为playing
+
+    // 收到音频数据说明连接和流传输正常
     if playbackState == .connecting {
-      print("检测到音频数据，设置状态为播放中")
       playbackState = .playing
       resetReconnectState()
     }
-    
-    if data.count > 0 && (data[0] & 0xF0) == 0xA0 {
-      print("收到音频配置数据")
-      initializeAudioDecoder(with: data)
-      return
+
+    // 检测音频配置包 (SoundFormat=10, AACPacketType=0)
+    if data.count > 1 && (data[0] & 0xF0) == 0xA0 && data[1] == 0x00 {
+      if audioDecoder?.formatDescription == nil {
+        initializeAudioDecoder(with: data)
+        return
+      }
     }
-    
+
     processAudioFrame(data: data, timestamp: timestamp)
   }
   
+  @MainActor
   internal func handleStatusChange(_ status: RTMPPlayerSession.Status) {
     print("RTMP状态变化: \(status)")
     
@@ -488,12 +602,14 @@ public class RTMPPlayer {
     }
   }
   
+  @MainActor
   internal func handleError(_ error: RTMPError) {
     print("RTMP错误: \(error)")
     playbackState = .error(error)
     attemptReconnect()
   }
   
+  @MainActor
   internal func handleMetaData(_ meta: MetaDataResponse) {
     print("收到元数据: \(meta)")
     
@@ -509,6 +625,7 @@ public class RTMPPlayer {
     delegate?.rtmpPlayer(self, didReceiveVideoConfiguration: config)
   }
   
+  @MainActor
   internal func handleStatistics(_ statistics: Any) {
     print("传输统计: \(statistics)")
     // 由于TransmissionStatistics类型不可用，我们传递一个简化的统计信息
@@ -527,7 +644,7 @@ public struct VideoConfiguration {
 public protocol RTMPPlayerDelegate: AnyObject {
   func rtmpPlayer(_ player: RTMPPlayer, didChangeState state: RTMPPlayer.PlaybackState)
   func rtmpPlayer(_ player: RTMPPlayer, didReceiveVideoSampleBuffer sampleBuffer: CMSampleBuffer)
-  func rtmpPlayer(_ player: RTMPPlayer, didReceiveAudioData data: Data, timestamp: Int64)
+  func rtmpPlayer(_ player: RTMPPlayer, didReceiveAudioSampleBuffer sampleBuffer: CMSampleBuffer)
   func rtmpPlayer(_ player: RTMPPlayer, didReceiveVideoConfiguration config: VideoConfiguration)
   func rtmpPlayer(_ player: RTMPPlayer, didUpdateStatistics statistics: Any) // 简化为Any类型
   func rtmpPlayerDidCleanupResources(_ player: RTMPPlayer)
@@ -557,8 +674,8 @@ private class RTMPPlayerPerformanceWrapper: RTMPPlayerDelegate {
     originalDelegate?.rtmpPlayer(player, didReceiveVideoSampleBuffer: sampleBuffer)
   }
   
-  func rtmpPlayer(_ player: RTMPPlayer, didReceiveAudioData data: Data, timestamp: Int64) {
-    originalDelegate?.rtmpPlayer(player, didReceiveAudioData: data, timestamp: timestamp)
+  func rtmpPlayer(_ player: RTMPPlayer, didReceiveAudioSampleBuffer sampleBuffer: CMSampleBuffer) {
+    originalDelegate?.rtmpPlayer(player, didReceiveAudioSampleBuffer: sampleBuffer)
   }
   
   func rtmpPlayer(_ player: RTMPPlayer, didReceiveVideoConfiguration config: VideoConfiguration) {

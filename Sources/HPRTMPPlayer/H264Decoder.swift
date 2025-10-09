@@ -7,6 +7,7 @@
 import Foundation
 import VideoToolbox
 import CoreMedia
+import QuartzCore
 
 class H264Decoder {
   private var decodeSession: VTDecompressionSession?
@@ -52,6 +53,8 @@ class H264Decoder {
 
   deinit {
     if let decodeSession = decodeSession {
+      // 等待所有帧完成后再销毁
+      VTDecompressionSessionWaitForAsynchronousFrames(decodeSession)
       VTDecompressionSessionInvalidate(decodeSession)
     }
   }
@@ -164,9 +167,6 @@ class H264Decoder {
 
     var formatDescription: CMFormatDescription?
 
-    let parameterSets: [Data] = [sps, pps]
-    let parameterSetSizes = parameterSets.map { $0.count }
-
     // 使用更简单直接的方法
     let status = sps.withUnsafeBytes { spsBytes in
       pps.withUnsafeBytes { ppsBytes in
@@ -205,7 +205,7 @@ class H264Decoder {
       kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     ]
 
-    var status = VTDecompressionSessionCreate(
+    let status = VTDecompressionSessionCreate(
       allocator: kCFAllocatorDefault,
       formatDescription: formatDescription,
       decoderSpecification: nil,
@@ -218,18 +218,40 @@ class H264Decoder {
       throw H264DecoderError.decompressionSessionCreationFailed(status: status)
     }
   }
+  
+  var prePTS: CMTimeValue = 0
+  
+  static var preOldPTS: CMTimeValue = 0
 
   func decodeSampleBuffer(_ sampleBuffer: CMSampleBuffer, completion: @escaping (CMSampleBuffer?, Error?) -> Void) {
+    // 记录解码开始时间
+    let decodeStartTime = CACurrentMediaTime()
+    
     guard let decodeSession = decodeSession else {
       completion(nil, H264DecoderError.decompressionSessionCreationFailed(status: -1))
       return
     }
-
-    var infoFlags = VTDecodeInfoFlags.asynchronous
+    
+    
+    
+    // test
+//    completion(sampleBuffer,nil)
+//    return
+    
+    // ⭐️ 关键：保存原始时间戳，不使用 VideoToolbox 返回的时间戳
+    let originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let originalDuration = CMSampleBufferGetDuration(sampleBuffer)
+    
+    let diff = originalPTS.value - prePTS
+    prePTS = originalPTS.value
+    print("[testb] decoder time: diff: \(diff)")
+    
+    // 使用同步解码，确保帧顺序和时序正确
+    var infoFlags = VTDecodeInfoFlags()
     let status = VTDecompressionSessionDecodeFrame(
       decodeSession,
       sampleBuffer: sampleBuffer,
-      flags: VTDecodeFrameFlags._EnableAsynchronousDecompression,
+      flags: [._EnableAsynchronousDecompression, ._1xRealTimePlayback], // 不使用异步标志，改为同步解码
       infoFlagsOut: &infoFlags
     ) { status, infoFlags, imageBuffer, presentationTimeStamp, presentationDuration in
       guard status == noErr else {
@@ -257,9 +279,10 @@ class H264Decoder {
 
       var sampleBuffer: CMSampleBuffer?
 
+      // ⭐️ 使用原始时间戳，而不是 VideoToolbox 返回的时间戳
       var timingInfo = CMSampleTimingInfo(
-        duration: presentationDuration,
-        presentationTimeStamp: presentationTimeStamp,
+        duration: originalDuration,
+        presentationTimeStamp: originalPTS,
         decodeTimeStamp: CMTime.invalid
       )
 
@@ -272,6 +295,17 @@ class H264Decoder {
       )
 
       if err == noErr, let sampleBuffer = sampleBuffer {
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let diff = timestamp.value - H264Decoder.preOldPTS
+        H264Decoder.preOldPTS = timestamp.value
+        
+        print("[testc] dif \(diff)")
+        
+        // 计算解码耗时
+        let decodeEndTime = CACurrentMediaTime()
+        let decodeDuration = (decodeEndTime - decodeStartTime) * 1000 // 转换为毫秒
+        print("[Decode Time] decode duration: \(String(format: "%.2f", decodeDuration)) ms")
+        
         completion(sampleBuffer, nil)
       } else {
         completion(nil, H264DecoderError.sampleBufferCreationFailed(status: err))
@@ -281,5 +315,8 @@ class H264Decoder {
     if status != noErr {
       completion(nil, H264DecoderError.frameDecodingFailed(status: status))
     }
+    
+    // 同步解码需要等待帧完成
+    VTDecompressionSessionWaitForAsynchronousFrames(decodeSession)
   }
 }

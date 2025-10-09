@@ -29,6 +29,15 @@
       }
     },
     {
+      "identity" : "swift-nio-ssl",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio-ssl",
+      "state" : {
+        "revision" : "b2b043a8810ab6d51b3ff4df17f057d87ef1ec7c",
+        "version" : "2.34.1"
+      }
+    },
+    {
       "identity" : "swift-system",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-system.git",
