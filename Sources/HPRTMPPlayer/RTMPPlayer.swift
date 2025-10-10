@@ -153,7 +153,7 @@ public class RTMPPlayer {
     cleanupResources()
     
     Task {
-      await rtmpPlayerSession.invalidate()
+      await rtmpPlayerSession.stop()
     }
   }
   
@@ -574,7 +574,7 @@ public class RTMPPlayer {
   }
   
   @MainActor
-  internal func handleStatusChange(_ status: RTMPPlayerSession.Status) {
+  internal func handleStatusChange(_ status: RTMPSessionStatus) {
     print("RTMP状态变化: \(status)")
     
     switch status {
@@ -598,6 +598,8 @@ public class RTMPPlayer {
         playbackState = .idle
       }
     case .unknown:
+      break
+    case .publishStart:
       break
     }
   }
